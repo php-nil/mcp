@@ -2,7 +2,6 @@
 
 namespace NilMcp;
 
-use Nil\Nil;
 use Nil\Kernel\Kernel;
 use Mcp\Capability\Discovery\SchemaValidator;
 use Mcp\Client;
@@ -50,7 +49,15 @@ use Monolog\Logger;
  *    服务端返回 -32602(清单滞后)时自动强制刷新并重试一次;
  *  - 未知工具名本地直接抛 InvalidArgumentException(附带可用工具列表)。
  *
- * 会话复用(跨 CLI/FPM 生命周期自动持久化):
+ * 协议时代(构造参数 $mode):
+ *  - MCP 2026-07-28 起进入「现代时代」: 取消 initialize 握手与 Mcp-Session-Id,
+ *    每个请求在 params._meta 自带协议版本, 一 POST 一响应(SDK 自动处理);
+ *  - 'stateless' 强制现代路径, 'handshake' 强制旧握手路径;
+ *  - 'auto'(默认)先尝试无状态并用一次 tools/list 实证(server/discover 对错误容错,
+ *    不能作为判据), 协议层异常即回退握手; 探测结果按身份缓存(TOOLS_TTL);
+ *  - 仅 auto 探测会回退; 显式指定模式时异常直接抛出。
+ *
+ * 会话复用(仅握手时代, 跨 CLI/FPM 生命周期自动持久化):
  *  - 首次连接走 initialize 握手, 服务端在 Mcp-Session-Id 响应头下发会话 ID;
  *  - 会话 ID 以「endpoint + 认证身份」为键存入文件缓存(CLI 与 FPM 共享),
  *    之后任意进程构造本类时自动取出复用, 无需调用方手动传递;
@@ -96,6 +103,21 @@ class McpClient
     public const string SESSION_HEADER = 'Mcp-Session-Id';
 
     /**
+     * 自动模式: 先尝试现代无状态, 失败回退握手, 探测结果按身份缓存
+     */
+    public const string MODE_AUTO = 'auto';
+
+    /**
+     * 握手时代(<= 2025-11-25): initialize 握手 + Mcp-Session-Id
+     */
+    public const string MODE_HANDSHAKE = 'handshake';
+
+    /**
+     * 现代时代(>= 2026-07-28): 无握手无会话, 每请求 _meta 自带协议版本
+     */
+    public const string MODE_STATELESS = 'stateless';
+
+    /**
      * 从入站 Request 自动继承的认证头（auto 认证透传）
      */
     private const array AUTH_HEADERS = ['Authorization', 'Cookie'];
@@ -132,6 +154,21 @@ class McpClient
     protected string $toolsCacheKey;
 
     /**
+     * 协议模式探测结果缓存键(仅 auto 模式写入)
+     */
+    protected string $modeCacheKey;
+
+    /**
+     * 构造时指定的模式(auto/handshake/stateless)
+     */
+    private string $mode;
+
+    /**
+     * 本次实际生效的模式; auto 在 connect() 探测后落定为具体值
+     */
+    private string $effectiveMode;
+
+    /**
      * 本次生命周期内已加载的工具清单: name => 工具定义
      *
      * @var array<string, array<string, mixed>>|null
@@ -148,25 +185,47 @@ class McpClient
     /**
      * 会话 ID 记录器(从响应头捕获, SDK 的 HttpTransport 未暴露该值)
      *
-     * @var object{sessionId: ?string}
+     * 仅握手时代创建; 无状态模式下为 null。
+     *
+     * @var object{sessionId: ?string}|null
      */
-    private object $recorder;
+    private ?object $recorder = null;
 
     /**
      * @param string|Request              $request    MCP 服务端地址；传入站 Symfony Request 时
      *                                                endpoint 取其 URI 并自动透传认证头
-     * @param string|null                 $session    显式指定会话 ID；为 null 时自动从缓存恢复
+     * @param string|null                 $session    显式指定会话 ID(仅握手时代有效)；
+     *                                                为 null 时自动从缓存恢复
      * @param array<string, string>       $headers    额外/覆盖的请求头（认证等）
      * @param ClientInterface|null        $httpClient 已配置认证的 PSR-18 客户端；
      *                                                为 null 时使用默认 Symfony 客户端
+     * @param string                      $mode       auto(默认, 探测后回退)|handshake|stateless
      */
     public function __construct(
         string|Request $request,
         private ?string $session = null,
         private array $headers = [],
         private ?ClientInterface $httpClient = null,
+        string $mode = self::MODE_AUTO,
     ) {
         $this->logger = Kernel::getLog()->withStreamLogger(self::PREFIX);
+
+        if (!\in_array($mode, [self::MODE_AUTO, self::MODE_HANDSHAKE, self::MODE_STATELESS], true)) {
+            throw new \InvalidArgumentException(sprintf(
+                'MCP 客户端模式必须是 auto/handshake/stateless, 非法值: %s',
+                $mode
+            ));
+        }
+        $this->mode = $mode;
+        $this->effectiveMode = $mode;
+
+        if (self::MODE_STATELESS === $mode && null !== $session) {
+            // 现代协议没有会话概念; 不抛错(保持调用方可复用同一套构造参数), 仅忽略并留痕
+            $this->logger->warning('stateless 模式无会话, 显式传入的 session ID 已忽略', [
+                'session' => $session,
+                'endpoint' => $request instanceof Request ? $request->getUri() : $request,
+            ]);
+        }
 
         // 文件缓存而非 APCu: CLI 与 FPM 的 APCu 内存不共享, 文件才能跨进程复用会话
         $this->cache = new Psr16Cache(
@@ -190,8 +249,10 @@ class McpClient
         $identity = hash('sha256', $this->endpoint . '|' . json_encode($this->headers));
         $this->cacheKey = 'sess_' . $identity;
         $this->toolsCacheKey = 'tools_' . $identity;
+        $this->modeCacheKey = 'mode_' . $identity;
 
-        if (null === $this->session) {
+        // 无状态模式没有会话, 既不恢复也不持久化 session 缓存
+        if (self::MODE_STATELESS !== $mode && null === $this->session) {
             $cached = $this->cache->get($this->cacheKey);
 
             // 兼容旧格式(裸 sid 字符串): 那时不记录版本, 按最新握手版本处理
@@ -216,7 +277,8 @@ class McpClient
      */
     public function run(string $method, array $params = []): array
     {
-        $resumed = null !== $this->session;
+        // 死会话重连只存在于握手时代; 无状态模式每次请求独立, 无会话可失效
+        $resumed = self::MODE_HANDSHAKE === $this->effectiveMode && null !== $this->session;
 
         try {
             return $this->call($method, $params);
@@ -253,10 +315,19 @@ class McpClient
      * 获取本次连接使用的会话 ID
      *
      * 正常情况下会话已自动持久化，无需调用方保存；此方法仅供排查/显式管理。
+     * 现代无状态模式下协议没有会话, 始终返回 null。
      */
     public function getSession(): ?string
     {
         return $this->session;
+    }
+
+    /**
+     * 获取实际生效的协议模式(auto 在首次连接探测后落定为 handshake/stateless)
+     */
+    public function getMode(): string
+    {
+        return $this->effectiveMode;
     }
 
     /**
@@ -305,13 +376,16 @@ class McpClient
 
         $result = $this->mcp->callTool($method, $params);
 
-        if (null !== $this->recorder->sessionId) {
-            $this->session = $this->recorder->sessionId;
-        }
+        // 会话捕获/续期只属于握手时代; 无状态模式没有 Mcp-Session-Id
+        if (self::MODE_HANDSHAKE === $this->effectiveMode) {
+            if (null !== $this->recorder?->sessionId) {
+                $this->session = $this->recorder->sessionId;
+            }
 
-        // 成功调用后续期会话缓存, 与服务端「读写刷新」对齐
-        if (null !== $this->session) {
-            $this->persistSession();
+            // 成功调用后续期会话缓存, 与服务端「读写刷新」对齐
+            if (null !== $this->session) {
+                $this->persistSession();
+            }
         }
 
         return $this->toArray($result);
@@ -581,11 +655,110 @@ class McpClient
     }
 
     /**
-     * 构建客户端与 HTTP 传输并建立连接
+     * 按生效模式建立连接; auto 模式先读探测缓存, 未探测过则现场探测
+     *
+     * 探测只在 auto 下发生, 且仅协议层异常(ConnectionException/RequestException)
+     * 才回退——网络/认证错误在两种模式下都不会成功, 回退没有意义。
+     */
+    private function connect(): void
+    {
+        if (self::MODE_AUTO === $this->effectiveMode) {
+            $cached = $this->cache->get($this->modeCacheKey);
+
+            if (self::MODE_STATELESS === $cached || self::MODE_HANDSHAKE === $cached) {
+                $this->effectiveMode = $cached;
+            }
+        }
+
+        if (self::MODE_AUTO !== $this->effectiveMode) {
+            self::MODE_STATELESS === $this->effectiveMode
+                ? $this->connectStateless()
+                : $this->connectHandshake();
+
+            return;
+        }
+
+        // 首次探测: 现代无状态链路成功时省掉握手往返, 也无需会话缓存治理
+        try {
+            $this->connectStateless();
+
+            // server/discover 对错误是容错的(SDK 设计如此, 避免元数据缺失阻塞业务),
+            // 故它不能作为服务端时代的判据; 用一次真实 tools/list 实证。
+            // 清单结果直接入缓存, 后续调用零额外请求。
+            $tools = $this->fetchTools();
+            $this->tools = $tools;
+            $this->cache->set($this->toolsCacheKey, $tools, self::TOOLS_TTL);
+
+            $this->rememberMode(self::MODE_STATELESS);
+        } catch (ConnectionException|RequestException $e) {
+            $this->logger->info('MCP 无状态连接不可用，回退握手模式', [
+                'endpoint' => $this->endpoint,
+                'error' => $e->getMessage(),
+            ]);
+
+            try {
+                // 无状态连接没有 sessionId, disconnect 不会发 DELETE
+                $this->mcp?->disconnect();
+            } catch (\Throwable) {
+                // 半开连接的清理失败不影响回退
+            }
+            $this->mcp = null;
+            $this->tools = null;
+
+            $this->connectHandshake();
+            $this->rememberMode(self::MODE_HANDSHAKE);
+        }
+    }
+
+    /**
+     * 记录探测落定的模式; 仅 auto 模式写缓存, 显式指定不污染自动判定
+     */
+    private function rememberMode(string $mode): void
+    {
+        $this->effectiveMode = $mode;
+
+        if (self::MODE_AUTO === $this->mode) {
+            $this->cache->set($this->modeCacheKey, $mode, self::TOOLS_TTL);
+        }
+    }
+
+    /**
+     * 现代无状态连接(>= 2026-07-28): 无握手、无会话
+     *
+     * 协议信封(params._meta 版本/能力/客户端信息)与 MCP-* 头均由 SDK 在
+     * setProtocolVersion(现代修订)后自动处理; connect() 只发一次
+     * server/discover 读取服务端元信息(服务端不答也不阻塞)。
+     */
+    private function connectStateless(): void
+    {
+        $psr17 = new Psr18Client();
+
+        $transport = new HttpTransport(
+            endpoint: $this->endpoint,
+            headers: $this->headers,
+            httpClient: $this->httpClient ?? $psr17,
+            requestFactory: $psr17,
+            streamFactory: $psr17,
+            logger: $this->logger,
+        );
+
+        $this->mcp = Client::builder()
+            ->setClientInfo('nil-mcp-client', '1.0.0')
+            ->setProtocolVersion(ProtocolVersion::V2026_07_28)
+            ->setInitTimeout(self::CONNECT_TIMEOUT)
+            ->setRequestTimeout(self::REQUEST_TIMEOUT)
+            ->setLogger($this->logger)
+            ->build();
+
+        $this->mcp->connect($transport);
+    }
+
+    /**
+     * 构建客户端与 HTTP 传输并建立握手时代连接
      *
      * 是否跳过握手(恢复会话)由传输层依据 $this->session 是否为 null 自行判断
      */
-    private function connect(): void
+    private function connectHandshake(): void
     {
         // PSR-17 工厂(与实际传输客户端分离: 注入的 httpClient 只负责发请求)
         $psr17 = new Psr18Client();

@@ -9,5 +9,5 @@ interface McpInterface
     /**
      * 构建
      */
-    public static function builder(Builder $builder, array $params);
+    public static function builder(Builder $builder, array $params): void;
 }

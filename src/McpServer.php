@@ -39,12 +39,6 @@ class McpServer
     public const int SCHEMA_TTL = 86400;
 
     /**
-     * MCP 配置行缓存有效期（秒）。设 0 关闭缓存（每次请求都查库）。
-     * 改了 mcp 表配置后，最多延迟这么久生效。
-     */
-    public const int CONFIG_TTL = 3600;
-
-    /**
      * 处理无效请求错误
      */
     public function errorInvalidRequest($message): JsonResponse
@@ -62,12 +56,16 @@ class McpServer
 
     /**
      * 处理 RPC 错误
+     *
+     * 内部异常细节只写日志, 不进入响应体, 避免向客户端泄漏路径/SQL/连接串等信息
      */
-    protected function rpcError(Error $error): JsonResponse
+    protected function rpcError(Error $error, ?\Throwable $exception = null): JsonResponse
     {
         $json = $error->jsonSerialize();
 
-        $this->logger->error('rpc error', $json);
+        $context = null !== $exception ? $json + ['exception' => $exception] : $json;
+        $this->logger->error('rpc error', $context);
+
         return new JsonResponse($json, 400);
     }
 
@@ -129,7 +127,7 @@ class McpServer
     public function run(string $class, array $params = []): Response
     {
         if (!class_exists($class) || !is_subclass_of($class, McpInterface::class)) {
-            return self::rpcError(
+            return $this->rpcError(
                 Error::forInternalError("server {$class} class is not valid MCP")
             );
         }
@@ -195,11 +193,14 @@ class McpServer
         }
 
 
-        $class::builder($builder, $params);
-
-        $server = $builder->build();
-
         try {
+            // 注册阶段也可能抛异常: BUILDERS fail-fast、register() 的必填常量校验、
+            // addTool/addResource 的 schema 校验等。统一收敛为 JSON-RPC 错误,
+            // 避免配置错误时端点吐出框架默认 HTML 错误页
+            $class::builder($builder, $params);
+
+            $server = $builder->build();
+
             $psrResponse = $server->run($transport);
 
             // Log the response body for debugging
@@ -218,8 +219,11 @@ class McpServer
 
             return $symfonyResponse;
         } catch (\Throwable $e) {
-            return self::rpcError(
-                Error::forServerError('server error: ' . $e->getMessage())
+            // $e->getMessage() 可能含文件路径/SQL/连接串等内部细节,
+            // 只写入服务端日志, 响应统一返回通用文案
+            return $this->rpcError(
+                Error::forServerError('internal server error'),
+                $e
             );
         }
     }

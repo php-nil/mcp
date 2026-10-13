@@ -1,4 +1,3 @@
 # PHP build artifacts
-/vendor
 /tests
 /.vscode

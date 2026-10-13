@@ -1,8 +1,12 @@
 # nil-mcp
 
-基于 [Nil 框架](https://github.com/nil/framework) 与官方 **PHP MCP SDK**（`Mcp\`）的 MCP 客户端 / 服务器封装包。以 Streamable HTTP 传输提供「注册工具」「远端调用工具」「会话与工具清单缓存」三大能力，统一收敛会话治理、参数对齐、类型纠正等样板逻辑。
+基于 [Nil 框架](https://github.com/php-nil) 与官方 **PHP MCP SDK**（`Mcp\`）的 MCP 客户端 / 服务器封装包。以 Streamable HTTP 传输提供「注册工具」「远端调用工具」「会话与工具清单缓存」三大能力，统一收敛会话治理、参数对齐、类型纠正等样板逻辑。
 
-命名空间：`NilMcp`，通过 `Nil-boot.php` 以 `Nil::lazyLoad()` 声明 `NilMcp\ → src` 的 PSR-4 映射。
+## 直接打包
+```
+https://raw.githubusercontent.com/php-nil/mcp/main/mcp.json
+```
+需要显示依赖`http`包。
 
 ## 组件一览
 
@@ -72,6 +76,28 @@ $result = $client->run('echo', ['text' => 'hello']);
 $tools = $client->listTools();
 ```
 
+## 协议双时代与模式选择
+
+MCP `2026-07-28` 起为「现代时代」：取消 `initialize` 握手与 `Mcp-Session-Id`，协议版本随每个请求的 `params._meta` 传递，一 POST 一响应；旧修订（≤ `2025-11-25`）仍走握手 + 会话。服务端端点（`StreamableHttpTransport` + `build()`）同时服务两个时代，按请求自动分流。
+
+`McpClient` 第 5 个构造参数 `$mode` 控制客户端行为：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto`（默认） | 先尝试无状态，以一次真实 `tools/list` 实证（`server/discover` 对错误容错，不能作判据）；协议层异常即回退握手，探测结果按身份缓存 |
+| `stateless` | 强制现代路径（无握手、无会话、无会话缓存）；失败直接抛出，不回退 |
+| `handshake` | 强制旧握手路径；显式 `$session` 仅在此模式有意义 |
+
+```php
+// 显式指定（例如已知服务端只支持旧协议时避免每次探测）
+$client = new McpClient('https://legacy.example.com/mcp', mode: McpClient::MODE_HANDSHAKE);
+
+$client->run('echo', ['text' => 'hello']);
+$client->getMode();           // 'handshake' | 'stateless'（auto 探测落定后的实际模式）
+$client->getProtocolVersion(); // '2025-11-25' | '2026-07-28'
+$client->getSession();        // stateless 下始终为 null
+```
+
 ## 客户端参数对齐与自愈
 
 `run()` 在发请求前会拉取（或读缓存）目标工具的 `inputSchema`，并完成两件事：
@@ -91,6 +117,7 @@ $tools = $client->listTools();
 | 客户端会话 ID | 文件缓存（`PhpFilesAdapter`） | `SESSION_TTL` = 7200s | 跨 CLI/FPM 进程共享，空闲过期后自动重握手 |
 | 服务器会话状态 | APCu（`ApcuAdapter`） | `SESSION_TTL` = 7200s | FPM 多 worker 共享内存，无文件锁竞争，匹配并发场景 |
 | 客户端工具清单 | 文件缓存 | `TOOLS_TTL` = 3600s | 按「endpoint + 认证身份」隔离 |
+| 客户端模式探测 | 文件缓存 | `TOOLS_TTL` = 3600s | 仅 `auto` 模式写入；过期后重新探测，服务端升级/降级最迟此周期感知 |
 | 输入 schema | APCu（`ApcuAdapter`） | `SCHEMA_TTL` = 86400s | key 含源码 mtime，改代码自动失效 |
 
 > 服务端（`McpServer`）运行于 FPM 需应对并发，故会话 / schema 统一走 APCu 共享内存
@@ -102,3 +129,6 @@ $tools = $client->listTools();
 - 会话缓存键使用 `sha256(endpoint | headers)`，实现「endpoint + 认证身份」隔离。
 - 工具清单需分页游标拉取（服务端单页 20 个）。
 - 会话数据修改后需显式 `SessionInterface::save()` 保存。
+- `BUILDERS` 在注册阶段做 fail-fast 校验：类不存在或未继承 `McpBuilderAbstract` 会直接抛 `LogicException`，不静默跳过。
+- `McpAbstract::_init()` 每个具体子类只运行一次（FPM 请求级天然一次，常驻运行时同进程重复构建亦受保护）。
+- 服务端未捕获异常的细节（文件路径 / SQL / 连接串等）只写入日志，JSON-RPC 响应统一返回 `internal server error`，不向客户端泄漏内部信息。

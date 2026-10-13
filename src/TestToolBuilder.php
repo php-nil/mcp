@@ -3,8 +3,9 @@
 namespace NilMcp;
 
 use Mcp\Capability\Attribute\Schema;
+
 /**
- * MCP 注册抽象基类(通用)
+ * 测试工具示例: 配合 TestMcp 演示最小工具声明
  */
 class TestToolBuilder extends McpBuilderAbstract
 {
