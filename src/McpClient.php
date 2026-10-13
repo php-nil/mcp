@@ -225,6 +225,8 @@ class McpClient
                 'session' => $session,
                 'endpoint' => $request instanceof Request ? $request->getUri() : $request,
             ]);
+            // 彻底忽略: 保证 stateless 下 getSession() 恒为 null, 且后续逻辑无残留会话
+            $this->session = null;
         }
 
         // 文件缓存而非 APCu: CLI 与 FPM 的 APCu 内存不共享, 文件才能跨进程复用会话
@@ -705,8 +707,10 @@ class McpClient
             $this->mcp = null;
             $this->tools = null;
 
-            $this->connectHandshake();
+            // 无状态已被实证不可用, 回退决定即落定(即便握手随后也失败,
+            // 模式判定依然成立, 避免后续实例重复探测同一条死路)
             $this->rememberMode(self::MODE_HANDSHAKE);
+            $this->connectHandshake();
         }
     }
 
