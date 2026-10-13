@@ -1,0 +1,15 @@
+{
+    "name": "php-nil/mcp",
+    "description": "Nil MCP - NIL framework component",
+    "keywords": ["nil", "mcp", "framework", "symfony"],
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2",
+        "mcp/sdk": "^0.8.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "NilMcp\\": "src/"
+        }
+    }
+}
