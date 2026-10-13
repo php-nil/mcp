@@ -2,7 +2,7 @@
     "composer": {
         "require": {
             "mcp/sdk": "^0.8.0",
-            "php-nil/kernel": "dev-main"
+            "php-nil/mcp": "dev-main"
         },
         "repositories": [
             {
